@@ -1,141 +1,205 @@
-const { Groq } = require('groq-sdk');
-const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-require('dotenv').config();
+const { Groq } = require("groq-sdk");
+const {
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  codeBlock,
+} = require("discord.js");
+const { ComponentType } = require("discord.js");
+const { MessageFlags } = require("discord.js");
+require("dotenv").config();
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
+/**
+ * @param {import("discord.js").Client} client
+ * @param {import("discord.js").Message} message
+ */
 module.exports = async (client, message) => {
   if (message.author.bot) return;
-  if (!message.content.startsWith(';compile')) return;
+  if (!message.content.startsWith(";compile")) return;
 
-  await message.react('⏳');
-  const match = message.content.match(/```(\w+)\n([\s\S]*?)```/);
+  const match = message.content.match(/```([\w#+.-]+)\n([\s\S]*?)```/);
 
   if (!match) {
     const embed = new EmbedBuilder()
-      .setTitle('❌ Format error!')
-      .setDescription(`Use ;compile command with code block under (language specified)`)
+      .setTitle("❌ Format error!")
+      .setDescription(
+        `Use ;compile command with code block under (language specified)`,
+      )
       .setColor(0xd21872)
       .setTimestamp();
-    await message.reactions.removeAll();
-    await message.react('❌');
+
+    await message.react("❌");
+
     return message.reply({ embeds: [embed] });
   }
 
-  const lang = match[1];
-  const code = match[2].trim();
-
   try {
+    const reaction = await message.react("⏳");
+
+    const lang = match[1];
+    const code = match[2].trim();
+
     const output = await runCode(lang, code);
 
-    if (!output.trim()) {
-      await message.reactions.removeAll();
-      await message.react('⚠️');
-      return message.reply('⚠️ No output returned.');
-    }
-
-    const safeOutput = output.slice(0, 1900);
-    const lineCount = safeOutput.split('\n').length;
-    const charCount = safeOutput.length;
-    let isError = false;
-
-    if (lineCount > 5 || charCount > 300) {
-      const checkCompletion = await groq.chat.completions.create({
-        messages: [
-          {
-            role: 'user',
-            content: `Given the following bot code:\n\`\`\`${lang}\n${code}\n\`\`\`\n\nAnd the following output:\n\`\`\`\n${safeOutput}\n\`\`\`\n\nDoes this output indicate an error? Respond ONLY with YES or NO.`,
-          },
-        ],
-        model: 'llama-3.3-70b-versatile',
-        temperature: 0.1,
-        top_p: 0.3,
-        max_completion_tokens: 10,
-      });
-
-      const checkResult = checkCompletion.choices[0].message.content.trim();
-      isError = checkResult.toUpperCase().includes('YES');
-    }
+    await reaction.remove().catch(() => {});
 
     const embed = new EmbedBuilder()
-      .setTitle('🧪 Output')
-      .setDescription(`\`\`\`\n${safeOutput}\n\`\`\``)
-      .setColor(0x18d272)
       .setFooter({ text: `${message.author.tag} | ${lang}` })
       .setTimestamp();
 
-    await message.reactions.removeAll();
-    await message.react('✅');
+    const isSuccess = output.success && !output.stderr && output.exitCode === 0;
 
-    if (isError) {
+    if (output.stdout) {
+      embed.addFields({
+        name: "Stdout:",
+        value: codeBlock(output.stdout.slice(0, 1000)),
+      });
+    }
+
+    if (output.stderr) {
+      embed.addFields({
+        name: "Stderr:",
+        value: codeBlock(output.stderr.slice(0, 1000)),
+      });
+    }
+
+    if (isSuccess) {
+      embed.setTitle("🧪 Output").setColor(0x4caf50);
+
+      await message.react("✅");
+      await message.reply({ embeds: [embed] });
+
+      return;
+    }
+
+    embed.setTitle("❌ Compilation error!").setColor(0xd21872);
+
+    if (!output.success) {
+      embed.setDescription("Failed to request code execution.");
+    } else if (output.exitCode !== 0) {
+      embed.setDescription(`Exit code: ${output.exitCode}`);
+    }
+
+    await message.react("❌");
+
+    if (output.stderr) {
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId('explain_fix')
-          .setLabel('Explain and Fix')
-          .setStyle(ButtonStyle.Success)
+          .setCustomId("explain_fix")
+          .setLabel("Explain and Fix")
+          .setStyle(ButtonStyle.Success),
       );
 
       const sent = await message.reply({ embeds: [embed], components: [row] });
 
       const collector = sent.createMessageComponentCollector({
-        componentType: 'BUTTON',
+        componentType: ComponentType.Button,
         time: 60_000,
+        filter: (i) => i.user.id === message.author.id,
       });
 
-      collector.on('collect', async (interaction) => {
-        if (interaction.customId === 'explain_fix') {
-          await interaction.deferUpdate();
-
-          const fixCompletion = await groq.chat.completions.create({
-            messages: [
-              {
-                role: 'user',
-                content: `Given the following bot code:\n\`\`\`${lang}\n${code}\n\`\`\`\n\nAnd the following output:\n\`\`\`\n${safeOutput}\n\`\`\`\n\nExplain the error and provide a way to fix it.`,
-              },
-            ],
-            model: 'llama-3.3-70b-versatile',
-            temperature: 0.8,
-            max_completion_tokens: 640,
-          });
-
-          const fixText = fixCompletion.choices[0].message.content.trim().slice(0, 1900);
-
-          const fixEmbed = new EmbedBuilder()
-            .setTitle('🛠️ Error Fix')
-            .setDescription(fixText)
-            .setColor(0x18d272)
-            .setFooter({ text: `${message.author.tag} | ${lang}` })
-            .setTimestamp();
-
-          return interaction.followUp({ embeds: [fixEmbed] });
+      collector.on("collect", async (interaction) => {
+        if (interaction.customId !== "explain_fix") {
+          return;
         }
+
+        await interaction.deferUpdate();
+
+        const content = [`Given the following code:`, codeBlock(lang, code)];
+
+        if (output.stdout) {
+          content.push(`With stdout:`, codeBlock(output.stdout.slice(0, 1000)));
+        }
+
+        if (output.stderr) {
+          content.push(`With stderr:`, codeBlock(output.stderr.slice(0, 1000)));
+        }
+
+        content.push(
+          `Explain the error and provide a way to fix it as short as possible.`,
+        );
+
+        const fixCompletion = await groq.chat.completions.create({
+          messages: [
+            {
+              role: "user",
+              content: content.join("\n"),
+            },
+          ],
+          model: "llama-3.3-70b-versatile",
+          temperature: 0.8,
+          max_completion_tokens: 640,
+        });
+
+        const fixText = fixCompletion.choices[0].message.content
+          .trim()
+          .slice(0, 1900);
+
+        const fixEmbed = new EmbedBuilder()
+          .setTitle("🛠️ Error Fix")
+          .setDescription(fixText)
+          .setColor(0x18d272)
+          .setFooter({ text: `${message.author.tag} | ${lang}` })
+          .setTimestamp();
+
+        return interaction.followUp({ embeds: [fixEmbed] });
+      });
+
+      collector.on("ignore", (i) => {
+        i.reply({
+          content: "This button is not for you.",
+          flags: MessageFlags.Ephemeral,
+        }).catch(() => {});
       });
     } else {
-      return message.reply({ embeds: [embed] });
+      await message.reply({ embeds: [embed] });
     }
   } catch (err) {
     const embed = new EmbedBuilder()
-      .setTitle('❌ Error running code')
+      .setTitle("❌ Error running code")
       .setDescription(`\`\`\`\n${err.message}\n\`\`\``)
       .setColor(0xd21872)
       .setTimestamp();
-    await message.reactions.removeAll();
-    await message.react('❌');
+    await message.reactions.removeAll().catch(() => {});
+    await message.react("❌");
     return message.reply({ embeds: [embed] });
   }
 };
 
 async function runCode(lang, code) {
-  const res = await fetch('https://emkc.org/api/v2/piston/execute', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      language: lang,
-      version: '*',
-      files: [{ content: code }],
-    }),
-  });
+  try {
+    const res = await fetch("https://emkc.org/api/v2/piston/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        language: lang,
+        version: "*",
+        files: [{ content: code }],
+      }),
+    });
 
-  const data = await res.json();
-  return data.run.output || data.run.stderr || 'No output';
+    if (res.ok) {
+      const data = await res.json();
+
+      if (!data.run) {
+        return { success: false };
+      }
+
+      const { stdout, stderr, code } = data.run;
+
+      return {
+        success: true,
+        stdout,
+        stderr,
+        exitCode: code,
+      };
+    }
+  } catch (error) {
+    console.error("An error occurred while trying to run code:", error);
+  }
+
+  return { success: false };
 }
